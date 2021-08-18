@@ -32,8 +32,8 @@ type aligner struct {
 	alphabet []byte
 
 	constraints []Constraint
-	insertCost  uint
-	deleteCost  uint
+	insertCosts CostFunction
+	deleteCosts CostFunction
 
 	out         chan sequencing.Sequence
 	input       <-chan sequencing.Sequence
@@ -41,7 +41,10 @@ type aligner struct {
 }
 
 func NewAligner(n int, alphabet []byte, cs []Constraint, insertCost, deleteCost uint) *aligner {
-	return &aligner{out: make(chan sequencing.Sequence, n+1), alphabet: alphabet, constraints: cs, insertCost: insertCost + 4, deleteCost: deleteCost + 4, numRoutines: n}
+	return &aligner{out: make(chan sequencing.Sequence, n+1), alphabet: alphabet, constraints: cs, insertCosts: NewFixedCost(insertCost + 4), deleteCosts: NewFixedCost(deleteCost + 4), numRoutines: n}
+}
+func NewCostedAligner(n int, alphabet []byte, cs []Constraint, insertCost, deleteCost CostFunction) *aligner {
+	return &aligner{out: make(chan sequencing.Sequence, n+1), alphabet: alphabet, constraints: cs, insertCosts: insertCost, deleteCosts: deleteCost, numRoutines: n}
 }
 
 func (r *aligner) GetOutput() <-chan sequencing.Sequence {
@@ -77,8 +80,14 @@ func (r *aligner) Align(seq sequencing.Sequence, states stateList, nextStates st
 	states[0] = nil
 	contents := seq.GetContents()
 
-	thresholdCost := uint(len(contents)) * r.insertCost
-
+	// pre-calculate all insert costs for each entry in contents
+	remainingInsertCost := uint(0)
+	earlyEndCosts := make([]uint, len(contents))
+	for i := len(contents)-1; i >= 0; i-- {
+		remainingInsertCost += r.insertCosts.GetCost(seq, uint(i))
+		earlyEndCosts[i] = remainingInsertCost
+	}
+	thresholdCost := earlyEndCosts[0]
 	// search
 	for i, b := range contents {
 		alphaIndex := 0
@@ -87,6 +96,11 @@ func (r *aligner) Align(seq sequencing.Sequence, states stateList, nextStates st
 
 		// clear next states
 		nextStates = nextStates[:0]
+
+		// determine insert and delete costs for this entry
+		insertCost := r.insertCosts.GetCost(seq, uint(i))
+		deleteCost := r.deleteCosts.GetCost(seq, uint(i))
+
 		// test each prior state
 		for _, s := range states {
 			prevCost := uint(0)
@@ -101,12 +115,12 @@ func (r *aligner) Align(seq sequencing.Sequence, states stateList, nextStates st
 			}
 			// add the insert option: ignore this entirely: same as prior state, but higher cost
 			if pos > 0 {
-				n := state{output: prevB, cost: prevCost + r.insertCost, position: pos - 1, prev: s, ancestor: ancestor}
+				n := state{output: prevB, cost: prevCost + insertCost, position: pos - 1, prev: s, ancestor: ancestor}
 				nextStates = append(nextStates, &n)
 			} else {
 				// we can skip the first base too (i.e. it was inserted)
 				// this kind of wants to be a nil state, but with a cost. So a hack.
-				n := state{output: 0, cost: prevCost + r.insertCost, position: 0, prev: s, ancestor: ancestor}
+				n := state{output: 0, cost: prevCost + insertCost, position: 0, prev: s, ancestor: ancestor}
 				nextStates = append(nextStates, &n)
 			}
 
@@ -128,8 +142,11 @@ func (r *aligner) Align(seq sequencing.Sequence, states stateList, nextStates st
 				//valid steps are free
 				cost := prevCost + optionCost - 1
 				nextStates = append(nextStates, &state{output: b, cost: prevCost + optionCost - 1, position: pos, prev: s, ancestor: ancestor})
-				if cost+r.insertCost*uint(len(contents)-i-1) < thresholdCost {
-					thresholdCost = cost + r.insertCost*uint(len(contents)-i-1)
+				// estimate future insert cost
+				futureCost := earlyEndCosts[i]
+				//r.insertCost * uint(len(contents)-i-1)
+				if cost+futureCost < thresholdCost {
+					thresholdCost = cost + futureCost
 				}
 			}
 			// a delete of 1-4 valid options, plus a match to a later state
@@ -147,7 +164,7 @@ func (r *aligner) Align(seq sequencing.Sequence, states stateList, nextStates st
 
 			for j := pos + 1; j < pos+5; j++ {
 				// make the delete state just before this
-				s = &state{output: priorBase, position: j - 1, cost: prevCost + r.deleteCost, prev: s, ancestor: ancestor}
+				s = &state{output: priorBase, position: j - 1, cost: prevCost + deleteCost, prev: s, ancestor: ancestor}
 				prevCost = s.cost
 				// test the options here for a match
 				for k := 0; k < len(options); k++ {
